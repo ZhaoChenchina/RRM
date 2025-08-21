@@ -1,1 +1,193 @@
-TLSTM
+import numpy as np
+import pandas as pd
+import h5py
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.impute import KNNImputer
+from sklearn.metrics import r2_score
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+from deap import base, creator, tools, algorithms
+
+# --------------------
+# 1. Data Loading
+# --------------------
+def load_data(file_path, dataset_name):
+    with h5py.File(file_path, 'r') as f:
+        data = np.array(f[dataset_name])
+    return pd.DataFrame(data)
+
+# --------------------
+# 2. Data Preprocessing (Section 3.2)
+# --------------------
+def preprocess_data(df, window_size=30):
+    imputer = KNNImputer(n_neighbors=1)
+    df_imputed = pd.DataFrame(imputer.fit_transform(df), columns=df.columns)
+
+    z_scores = np.abs((df_imputed - df_imputed.mean()) / df_imputed.std())
+    df_cleaned = df_imputed[(z_scores < 3).all(axis=1)]
+
+    Q1 = df_cleaned.quantile(0.25)
+    Q3 = df_cleaned.quantile(0.75)
+    IQR = Q3 - Q1
+    df_final = df_cleaned[~((df_cleaned < (Q1 - 1.5 * IQR)) | (df_cleaned > (Q3 + 1.5 * IQR))).any(axis=1)]
+
+    scaler = MinMaxScaler()
+    df_scaled = pd.DataFrame(scaler.fit_transform(df_final), columns=df_final.columns)
+
+    sequences, targets = [], []
+    data = df_scaled.values
+    for i in range(len(data) - window_size):
+        sequences.append(data[i:i+window_size])
+        targets.append(data[i+window_size, -1])
+
+    return np.array(sequences), np.array(targets)
+
+# --------------------
+# 3. Spatial Attention Layer
+# --------------------
+class SpatialAttention(layers.Layer):
+    def __init__(self):
+        super(SpatialAttention, self).__init__()
+        self.dense = layers.Dense(1, activation='tanh')
+
+    def call(self, inputs):
+        scores = self.dense(inputs)
+        attention_weights = tf.nn.softmax(scores, axis=1)
+        return inputs * attention_weights
+
+# --------------------
+# 4. TLSTM Model
+# --------------------
+class TLSTM(Model):
+    def __init__(self, hidden_units=64, dropout_rate=0.2, num_layers=1, activation='tanh'):
+        super(TLSTM, self).__init__()
+        self.attention = SpatialAttention()
+        self.lstm_layers = [layers.LSTM(hidden_units, return_sequences=(i < num_layers-1), dropout=dropout_rate)
+                            for i in range(num_layers)]
+        if activation == 'relu':
+            self.activation = tf.nn.relu
+        elif activation == 'leaky_relu':
+            self.activation = tf.nn.leaky_relu
+        elif activation == 'sigmoid':
+            self.activation = tf.nn.sigmoid
+        elif activation == 'linear':
+            self.activation = tf.identity
+        else:
+            self.activation = tf.nn.tanh
+        self.dense = layers.Dense(1)
+
+    def call(self, inputs):
+        x = self.attention(inputs)
+        for lstm in self.lstm_layers:
+            x = lstm(x)
+        return self.dense(self.activation(x))
+
+# --------------------
+# 5. Metrics
+# --------------------
+def nse(y_true, y_pred):
+    return 1 - np.sum((y_true - y_pred)**2) / np.sum((y_true - np.mean(y_true))**2)
+
+def rmse(y_true, y_pred):
+    return np.sqrt(np.mean((y_true - y_pred)**2))
+
+def atpe(y_true, y_pred):
+    n = int(len(y_true) * 0.02)
+    idx = np.argsort(y_true)[-n:]
+    return np.mean(np.abs((y_true[idx] - y_pred[idx]) / y_true[idx]))
+
+def kge(y_true, y_pred):
+    r = np.corrcoef(y_true, y_pred)[0, 1]
+    alpha = np.std(y_pred) / np.std(y_true)
+    beta = np.mean(y_pred) / np.mean(y_true)
+    return 1 - np.sqrt((r - 1)**2 + (alpha - 1)**2 + (beta - 1)**2)
+
+def mbe(y_true, y_pred):
+    return np.mean(y_pred - y_true)
+
+# --------------------
+# 6. Differential Evolution Optimizer
+# --------------------
+class DEOptimizer:
+    def __init__(self, population_size=20, generations=10):
+        self.population_size = population_size
+        self.generations = generations
+
+    def optimize(self, objective_func, param_ranges):
+        creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+        creator.create("Individual", list, fitness=creator.FitnessMax)
+
+        toolbox = base.Toolbox()
+
+        for name, (low, high) in param_ranges.items():
+            toolbox.register(f"attr_{name}", np.random.uniform, low, high)
+
+        toolbox.register("individual", tools.initCycle, creator.Individual,
+                         [toolbox.__getattribute__(f"attr_{k}") for k in param_ranges.keys()], n=1)
+        toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+        def evaluate(ind):
+            params = {k: v for k, v in zip(param_ranges.keys(), ind)}
+            return objective_func(params),
+
+        toolbox.register("evaluate", evaluate)
+        toolbox.register("mate", tools.cxBlend, alpha=0.5)
+        toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=0.2, indpb=0.2)
+        toolbox.register("select", tools.selTournament, tournsize=3)
+
+        population = toolbox.population(n=self.population_size)
+
+        algorithms.eaSimple(population, toolbox, cxpb=0.5, mutpb=0.2, ngen=self.generations, verbose=False)
+
+        best_ind = tools.selBest(population, 1)[0]
+        return {k: v for k, v in zip(param_ranges.keys(), best_ind)}
+
+# --------------------
+# 7. Main Execution
+# --------------------
+def main():
+    df = load_data("camels.h5", "runoff_data")
+    X, y = preprocess_data(df, window_size=30)
+
+    param_ranges = {
+        "batch_size": (8, 256),
+        "epochs": (32, 1024),
+        "dropout_rate": (0.14, 0.32),
+        "num_layers": (1, 8),
+        "hidden_units": (8, 1024),
+        "learning_rate": (0.001, 0.041)
+    }
+
+    def objective(params):
+        model = TLSTM(hidden_units=int(params["hidden_units"]),
+                      dropout_rate=params["dropout_rate"],
+                      num_layers=int(params["num_layers"]),
+                      activation='tanh')
+        model.compile(optimizer=tf.keras.optimizers.Adam(params["learning_rate"]), loss='mse')
+        history = model.fit(X, y, epochs=int(params["epochs"]), batch_size=int(params["batch_size"]), verbose=0)
+        loss = history.history['loss'][-1]
+        return -loss
+
+    de = DEOptimizer(population_size=10, generations=5)
+    best_params = de.optimize(objective, param_ranges)
+    print("Best hyperparameters:", best_params)
+
+    model = TLSTM(hidden_units=int(best_params["hidden_units"]),
+                  dropout_rate=best_params["dropout_rate"],
+                  num_layers=int(best_params["num_layers"]),
+                  activation='tanh')
+    model.compile(optimizer=tf.keras.optimizers.Adam(best_params["learning_rate"]), loss='mse')
+    model.fit(X, y, epochs=int(best_params["epochs"]), batch_size=int(best_params["batch_size"]), verbose=1)
+
+    preds = model.predict(X).flatten()
+
+    print("NSE:", nse(y, preds))
+    print("RMSE:", rmse(y, preds))
+    print("ATPE:", atpe(y, preds))
+    print("KGE:", kge(y, preds))
+    print("R2:", r2_score(y, preds))
+    print("MBE:", mbe(y, preds))
+
+if __name__ == "__main__":
+    main()
+
